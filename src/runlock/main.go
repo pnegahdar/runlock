@@ -10,6 +10,8 @@ import (
 	"os/exec"
 	"strings"
 	"time"
+	"os/signal"
+	"syscall"
 )
 
 var flagEtcd = cli.StringFlag{Name: "etcd",
@@ -37,22 +39,71 @@ func addPrefix(key string) string {
 	return keyprefix + key
 }
 
-func subprocess(startSignal, stopSignal chan bool, cmdToRun string) {
-	command := []string{"/usr/bin/env", "sh", "-c", cmdToRun}
+// https://gist.github.com/jmervine/d88c75329f98e09f5c87
+func safeShellSplit(s string) []string {
+	split := strings.Split(s, " ")
+
+	var result []string
+	var inquote string
+	var block string
+	for _, i := range split {
+		if inquote == "" {
+			if strings.HasPrefix(i, "'") || strings.HasPrefix(i, "\"") {
+				inquote = string(i[0])
+				block = strings.TrimPrefix(i, inquote) + " "
+			} else {
+				result = append(result, i)
+			}
+		} else {
+			if !strings.HasSuffix(i, inquote) {
+				block += i + " "
+			} else {
+				block += strings.TrimSuffix(i, inquote)
+				inquote = ""
+				result = append(result, block)
+				block = ""
+			}
+		}
+	}
+
+	return result
+}
+
+func subprocess(startSignal, stopSignal chan bool, osSignal chan os.Signal, cmdToRun string) {
+	command := safeShellSplit(cmdToRun)
 	var cmd *exec.Cmd
 	for {
 		select {
 		case <-startSignal:
-			fmt.Println("Starting the process.")
+			if cmd != nil {
+				continue
+			}
+			fmt.Println("Starting the process with command:")
+			fmt.Printf("%v", command)
 			cmd = exec.Command(command[0], command[1:]...)
 			cmd.Stderr = os.Stderr
 			cmd.Stdout = os.Stdout
-			go cmd.Run()
+			go func() {
+				err := cmd.Run()
+				if err != nil {
+					panic(err)
+				}
+			}()
 		case <-stopSignal:
 			fmt.Println("Killing the process.")
 			if cmd != nil {
 				cmd.Process.Kill()
-				cmd = nil
+			}
+		case sig := <-osSignal:
+			fmt.Println("Sending singal to the process:", sig)
+			if cmd != nil {
+				err := cmd.Process.Signal(sig)
+				if err != nil {
+					panic(err)
+				}
+			}
+			if sig == syscall.SIGTERM || sig == syscall.SIGINT {
+				os.Exit(1)
 			}
 		}
 	}
@@ -73,8 +124,9 @@ func runLoop(etcdEndpoint string, lockKey string, ttl int, heartbeat int, comman
 	}
 	lockKey = addPrefix(lockKey)
 	kapi := client.NewKeysAPI(c)
-	startSignal := make(chan bool)
-	stopSignal := make(chan bool)
+	startSignal := make(chan bool, 1)
+	stopSignal := make(chan bool, 1)
+
 
 	// Lock loop
 	go func() {
@@ -109,7 +161,10 @@ func runLoop(etcdEndpoint string, lockKey string, ttl int, heartbeat int, comman
 			}
 		}
 	}()
-	subprocess(startSignal, stopSignal, command)
+	// Forward signals
+	osSignal := make(chan os.Signal, 1)
+	signal.Notify(osSignal, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
+	subprocess(startSignal, stopSignal, osSignal, command)
 }
 
 func main() {

@@ -8,12 +8,12 @@ Grab the right precompiled bin from github releases and put it in your path. Don
 
 OSX:
 
-    curl -SL https://github.com/pnegahdar/runlock/releases/download/0.1.0/runlock_0.1.0_darwin_amd64.tar.gz \
+    curl -SL https://github.com/pnegahdar/runlock/releases/download/0.1.1/runlock_0.1.1_darwin_amd64.tar.gz \
         | tar -xzC /usr/local/bin --strip 1 && chmod +x /usr/local/bin/runlock
         
 Nix:
 
-    curl -SL https://github.com/pnegahdar/runlock/releases/download/0.1.0/runlock_0.1.0_linux_amd64.tar.gz \
+    curl -SL https://github.com/pnegahdar/runlock/releases/download/0.1.1/runlock_0.1.1_linux_amd64.tar.gz \
         | tar -xzC /usr/local/bin --strip 1 && chmod +x /usr/local/bin/runlock
         
         
