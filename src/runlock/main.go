@@ -10,8 +10,6 @@ import (
 	"os/exec"
 	"strings"
 	"time"
-	"os/signal"
-	"syscall"
 )
 
 var flagEtcd = cli.StringFlag{Name: "etcd",
@@ -27,8 +25,12 @@ var flagTTL = cli.IntFlag{Name: "ttl",
 var flagHeartBeat = cli.IntFlag{Name: "heartbeat",
 	Value: 3, EnvVar: "RUNLOCK_HEARTBEAT",
 	Usage: "How often to renew the lock"}
-var flagCommand = cli.StringFlag{Name: "command",
-	Usage: "The command to run, like 'echo hello'"}
+var flagCommandOnAcquire = cli.StringFlag{Name: "on-acquire",
+	Usage: "The command to run when lock is acquired."}
+var flagCommandOnRelease = cli.StringFlag{Name: "on-release",
+	Usage: "The command to run when lock is released."}
+var flagValue = cli.StringFlag{Name: "value",
+	Usage: "The identifier of this node for acquiring the lock"}
 
 const keyprefix = "/runlock/locks"
 
@@ -69,49 +71,18 @@ func safeShellSplit(s string) []string {
 	return result
 }
 
-func subprocess(startSignal, stopSignal chan bool, osSignal chan os.Signal, cmdToRun string) {
+func runCommand(cmdToRun string) error {
+	fmt.Println("Running command:", cmdToRun)
 	command := safeShellSplit(cmdToRun)
-	var cmd *exec.Cmd
-	for {
-		select {
-		case <-startSignal:
-			if cmd != nil {
-				continue
-			}
-			fmt.Println("Starting the process with command:")
-			fmt.Printf("%v", command)
-			cmd = exec.Command(command[0], command[1:]...)
-			cmd.Stderr = os.Stderr
-			cmd.Stdout = os.Stdout
-			go func() {
-				err := cmd.Run()
-				if err != nil {
-					panic(err)
-				}
-			}()
-		case <-stopSignal:
-			fmt.Println("Killing the process.")
-			if cmd != nil {
-				cmd.Process.Kill()
-			}
-		case sig := <-osSignal:
-			fmt.Println("Sending singal to the process:", sig)
-			if cmd != nil {
-				err := cmd.Process.Signal(sig)
-				if err != nil {
-					panic(err)
-				}
-			}
-			if sig == syscall.SIGTERM || sig == syscall.SIGINT {
-				os.Exit(1)
-			}
-		}
-	}
+	cmd := exec.Command(command[0], command[1:]...)
+	cmd.Stderr = os.Stderr
+	cmd.Stdout = os.Stdout
+	err := cmd.Run()
+	return err
 }
 
-func runLoop(etcdEndpoint string, lockKey string, ttl int, heartbeat int, command string) {
+func runLoop(myID, etcdEndpoint string, lockKey string, ttl int, heartbeat int, acquireCommand, releaseCommand string) {
 	hbDur := time.Second * time.Duration(heartbeat)
-	myUUID := uuid.NewV4().String()
 	cfg := client.Config{
 		Endpoints: []string{etcdEndpoint},
 		Transport: client.DefaultTransport,
@@ -124,47 +95,65 @@ func runLoop(etcdEndpoint string, lockKey string, ttl int, heartbeat int, comman
 	}
 	lockKey = addPrefix(lockKey)
 	kapi := client.NewKeysAPI(c)
-	startSignal := make(chan bool, 1)
-	stopSignal := make(chan bool, 1)
+	acquireSignal := make(chan bool, 1)
+	releaseSignal := make(chan bool, 1)
 
 
 	// Lock loop
 	go func() {
 		haveLock := false
+		loopedOnce := false
 		for {
 			setOptions := &client.SetOptions{PrevExist: client.PrevNoExist,
 				TTL: time.Second * time.Duration(ttl)}
-			kapi.Set(context.Background(), lockKey, myUUID, setOptions) // Error doesnt really matter here
+			kapi.Set(context.Background(), lockKey, myID, setOptions) // Error doesnt really matter here
 			resp, err := kapi.Get(context.Background(), lockKey, nil)
 			if err != nil {
 				panic(err)
 			}
-			if resp.Node.Value == myUUID {
+			if resp.Node.Value == myID {
 				// I have the lock
-				fmt.Println("I have the lock. Key:", lockKey)
+				now := time.Now().String()
+				fmt.Println(now, "I have the lock. Key:", lockKey, "Value:", resp.Node.Value)
 				if !haveLock {
+					acquireSignal <- true
 					haveLock = true
-					startSignal <- true
 				}
 				<-time.After(hbDur)
 				setOptions := &client.SetOptions{PrevExist: client.PrevIgnore,
 					PrevIndex: resp.Index,
 					TTL: time.Second * time.Duration(ttl)}
-				kapi.Set(context.Background(), lockKey, myUUID, setOptions)
+				_, err = kapi.Set(context.Background(), lockKey, myID, setOptions)
+				if err != nil {
+					fmt.Println("Ran into error:", err.Error())
+				}
 			} else {
-				fmt.Println("I dont have the lock. Key:", lockKey)
-				if haveLock {
+				now := time.Now().String()
+				fmt.Println(now, "I dont have the lock. Key:", lockKey, "Value:", resp.Node.Value)
+				if haveLock || ! loopedOnce {
+					releaseSignal <- true
 					haveLock = false
-					stopSignal <- true
 				}
 				<-time.After(hbDur)
 			}
+			loopedOnce = true
 		}
 	}()
-	// Forward signals
-	osSignal := make(chan os.Signal, 1)
-	signal.Notify(osSignal, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
-	subprocess(startSignal, stopSignal, osSignal, command)
+	runOrPanic := func(cmd string) {
+		err := runCommand(cmd)
+		if err != nil {
+			panic(err)
+		}
+	}
+	for {
+		select {
+		case <-acquireSignal:
+			go runOrPanic(acquireCommand)
+		case <-releaseSignal:
+			go runOrPanic(releaseCommand)
+		}
+	}
+
 }
 
 func main() {
@@ -176,25 +165,31 @@ func main() {
 			Name:    "run",
 			Aliases: []string{"r"},
 			Usage:   "Run the locker.",
-			Flags:   []cli.Flag{flagEtcd, flagLockKey, flagTTL, flagHeartBeat, flagCommand},
+			Flags:   []cli.Flag{flagEtcd, flagLockKey, flagTTL, flagHeartBeat, flagCommandOnAcquire, flagCommandOnRelease, flagValue},
 			Action: func(c *cli.Context) {
 				etcdHost := c.String(flagEtcd.Name)
 				key := c.String(flagLockKey.Name)
 				ttl := c.Int(flagTTL.Name)
 				heartbeat := c.Int(flagHeartBeat.Name)
-				command := c.String(flagCommand.Name)
+				commandOnAcquire := c.String(flagCommandOnAcquire.Name)
+				commandOnRelease := c.String(flagCommandOnRelease.Name)
+				lockValue := c.String(flagValue.Name)
+				if lockValue == "" {
+					lockValue = uuid.NewV4().String()
+				}
 				if heartbeat > ttl {
 					fmt.Println("Heartbeat must be less than ttl.")
 					os.Exit(1)
 				}
-				if command == "" || key == "" {
-					fmt.Println("Command  and key are required.")
+				if commandOnAcquire == "" || key == "" || commandOnRelease == "" {
+					fmt.Println("lock/release command  and key are required.")
 					os.Exit(1)
 				}
-				runLoop(etcdHost, key, ttl, heartbeat, command)
+				runLoop(lockValue, etcdHost, key, ttl, heartbeat, commandOnAcquire, commandOnRelease)
 
 			},
 		},
 	}
 	app.Run(os.Args)
 }
+
