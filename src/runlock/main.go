@@ -114,10 +114,10 @@ func runLoop(myID, etcdEndpoint string, lockKey string, ttl int, heartbeat int, 
 			if resp.Node.Value == myID {
 				// I have the lock
 				now := time.Now().String()
-				fmt.Println(now, "I have the lock. Key:", lockKey, "Value:", resp.Node.Value)
 				if !haveLock {
 					acquireSignal <- true
 					haveLock = true
+					fmt.Println(now, "I have the lock. Key:", lockKey, "Value:", resp.Node.Value)
 				}
 				<-time.After(hbDur)
 				setOptions := &client.SetOptions{PrevExist: client.PrevIgnore,
@@ -129,10 +129,10 @@ func runLoop(myID, etcdEndpoint string, lockKey string, ttl int, heartbeat int, 
 				}
 			} else {
 				now := time.Now().String()
-				fmt.Println(now, "I dont have the lock. Key:", lockKey, "Value:", resp.Node.Value)
 				if haveLock || ! loopedOnce {
 					releaseSignal <- true
 					haveLock = false
+					fmt.Println(now, "I dont have the lock. Key:", lockKey, "Value:", resp.Node.Value)
 				}
 				<-time.After(hbDur)
 			}
